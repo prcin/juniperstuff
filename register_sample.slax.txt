@@ -1,0 +1,800 @@
+version 1.0;
+ns junos = "http://xml.juniper.net/junos/*/junos";
+ns xnm = "http://xml.juniper.net/xnm/1.1/xnm";
+ns jcs = "http://xml.juniper.net/junos/commit-scripts/1.0";
+ns ext = "http://xmlsoft.org/XSLT/namespace";
+ns date = "http://exslt.org/dates-and-times";
+ns str = "http://exslt.org/strings";
+import "/var/db/scripts/import/junos.xsl";
+
+var $connection = jcs:open();
+var $retry-counts = 3;
+mvar $ha = false();
+
+template open-config() {
+  /* function to open config */
+  var $rpc = {
+    <open-configuration> {
+      <private>;
+    }
+  }
+  expr jcs:execute($connection, $rpc);
+}
+
+template commit-config($message) {
+  /* function to commit config */
+  var $rpc = {
+    <commit-configuration> {
+      <log> $message;
+    }
+  }
+  expr jcs:execute($connection, $rpc);
+}
+
+template execute-request-command($cmd) {
+  /* function to execute request command */
+  var $rpc = {
+      <command> $cmd;
+  }
+  var $res = jcs:invoke($rpc);
+  /* Give some buffer for script to run */
+  expr jcs:sleep(10);
+}
+
+template get-hostname() {
+  var $rpc = <get-software-information>;
+  mvar $nodes;
+  if ($ha) {
+    set $nodes = jcs:execute($connection, $rpc)//software-information;
+  } else {
+    set $nodes = jcs:execute($connection, $rpc);
+  }
+
+
+  var $results = <info> {
+    for-each($nodes) {
+      <value> {
+        <host> host-name;
+        <version> package-information/comment;
+      }
+    }
+  }
+  var $r = ext:node-set($results);
+
+  <values> {
+    if ($ha) {
+      <host> concat($r/info/value[1]/host, "::", $r/info/value[2]/host);
+    } else {
+      <host> $r/info/value[1]/host;
+    }
+    <version> $r/info/value[1]/version;
+  }
+}
+
+template get-model-sn() {
+  var $rpc = <get-chassis-inventory>;
+  var $chassis = jcs:execute($connection, $rpc)//chassis;
+  if (count($chassis) > 1) {
+    expr jcs:output("You're about to operate on an HA pair.");
+    set $ha = true();
+  }
+  var $results = <info> {
+    for-each($chassis) {
+      <value> {
+        <sn> serial-number;
+        <model> description;
+      }
+    }
+  }
+  var $r = ext:node-set($results);
+
+  <values> {
+    if ($ha) {
+      <sn> concat($r/info/value[1]/sn, "-", $r/info/value[2]/sn);
+    } else {
+      <sn> $r/info/value[1]/sn;
+    }
+    <model> $r/info/value[1]/model;
+  }
+}
+
+template is-license-found() {
+  param $f_block;
+  param $lic-name;
+
+  var $block = <features> {
+    for-each( $f_block/feature ) {
+      if ( name == $lic-name) {
+        <yes> "yes";
+      }
+    }
+  }
+
+  var $b = ext:node-set($block);
+  if ( count( $b/features/yes ) > 0 ) {
+    expr "true";
+  } else {
+    expr "false";
+  }
+}
+
+template get-license-sn-by-name () {
+  param $license-name;
+
+  var $cmd = <get-license-summary-information>;
+  var $all-licenses = jcs:execute( $connection, $cmd)//license-information/license;
+
+  var $results = <lic> {
+    for-each( $all-licenses ) {
+      var $bool = {
+        call is-license-found() {
+          with $f_block = feature-block;
+          with $lic-name = $license-name;
+        }
+      }
+      <value> {
+        <sn> software-sn;
+        <res> $bool;
+      }
+    }
+  }
+
+  var $r = ext:node-set($results);
+
+  var $result-found = <license> {
+    for-each ( $r/lic/value ) {
+      if ( res=='true' ) {
+        <sn> sn;
+      }
+    }
+  }
+
+  var $rr = ext:node-set($result-found);
+
+  expr $rr/license/sn[1];
+}
+
+template get-argon-status($api_type, $seconds, $retry-limit) {
+  /* get argon status to see if an srx is (dis)enrolled successfully */
+  var $rpc = {
+    <rpc> {
+      <show-aamw-status>;
+    }
+  }
+
+  mvar $done = false();
+  mvar $success = false();
+  mvar $count = 0;
+  mvar $status;
+
+  while (not($done)) {
+    set $count = $count + 1;
+    expr jcs:output("Wait for aamwd connection status #" _ $count _ "...");
+    expr jcs:sleep($seconds);
+    set $status = jcs:execute($connection, $rpc)//aamw-connection-status;
+
+
+    if ($api_type == "enroll") {
+      if ($status == "Connected") {
+        set $done = true();
+        set $success = true();
+      }
+    } else {
+      if ($status == "Not connected" || !($status)) {
+        set $done = true();
+        set $success = true();
+      }
+    }
+
+    if ($count == $retry-limit) {
+      set $done = true();
+    }
+  }
+
+  if (not($success)) {
+    if ($api_type == "enroll") {
+      expr jcs:output("Enroll SRX is finished. However aamw connection status is incorrect: " _ $status _ " (expecting 'Connected'). Please check your network connection and other configuration");
+    } else {
+      expr jcs:output("Disenroll SRX is finished. However aamw connection status is incorrect: " _ $status _ "");
+    }
+  } else {
+    if ($api_type == "enroll") {
+      expr jcs:output("SRX was enrolled successfully!");
+    } else {
+      expr jcs:output("SRX was disenrolled successfully!");
+    }
+  }
+}
+
+template execute_remote_api($url) {
+  var $filename = "/var/tmp/tmp.txt";
+
+  expr jcs:output("Communicate with cloud...");
+  var $rpc1 = <file-copy> {
+    <source> $url;
+    <destination> $filename;
+  }
+
+  expr jcs:execute($connection, $rpc1);
+
+  var $rpc2 = <file-show> {
+    <filename> $filename;
+  }
+
+  var $rpc2ret = jcs:execute($connection, $rpc2);
+
+  var $ret = normalize-space($rpc2ret);
+  var $results = $ret;
+
+  /* don't know how to detect error, can only use regex */
+  var $error = jcs:regex("Failed", $results);
+
+  if ($error == "Failed") {
+    terminate "Calling remote API failed, please retry the script or contact administrator";
+  }
+
+  var $rpc3 = <file-delete> {
+    <path> $filename;
+  }
+
+  var $delete = jcs:execute($connection, $rpc3);
+  expr $ret;
+}
+
+template update-jdpi($retry-limit) {
+  expr jcs:output("Updating Application Signature DB ...");
+  call execute-request-command() {
+    with $cmd = "request services application-identification download";
+  }
+
+  mvar $done = false();
+  mvar $count = 0;
+  mvar $result;
+  mvar $error;
+  var $rpc = <rpc> {
+    <command> "request services application-identification download status";
+  };
+
+  while (not($done)) {
+    set $count = $count + 1;
+    expr jcs:output("Wait for Application Signature DB signature download status #" _ $count _ "...");
+    expr jcs:sleep(10);
+    set $result = jcs:execute($connection, $rpc);
+    set $error = jcs:regex("failed|succeed|first", $result);
+
+    if ($error == "failed") {
+      set $done = true();
+
+      /* Do we really want to terminate bootstrap
+          if updating jdpi signature failed?
+          NO for now but if we change the decision
+          just uncomment below code.
+      */
+      /* terminate "Updating Application Signature DB signature failed."; */
+    }
+
+    if ($error == "first") {
+      set $done = true();
+      /* If we dont' have AI license then we probably need to terminate */
+      /* terminate "Please install application identification license first.";*/
+    }
+
+    if ($error == "succeed") {
+      set $done = true();
+    }
+
+    if ($count == $retry-limit) {
+      set $done = true();
+    }
+  }
+
+  call execute-request-command() {
+    with $cmd = "request services application-identification install";
+  }
+}
+
+template config-argon-ca($ca-profile, $identity, $enroll-url, $crl) {
+  /* configure Argon CA server */
+  expr jcs:output("Configure CA...");
+  call open-config();
+  var $rpc = {
+    <load-configuration> {
+      <configuration> {
+        <security> {
+          <pki> {
+            <ca-profile> {
+              <name> $ca-profile;
+              <ca-identity> $identity;
+              <enrollment> {
+                <url> $enroll-url;
+              }
+              <revocation-check> {
+                <disable>;
+                <crl> {
+                  <url> $crl;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  expr jcs:execute($connection, $rpc);
+  call commit-config(){
+    with $message = "CA profile " _ $ca-profile _ " is added.";
+  }
+}
+
+template config-and-download-ca($ca-profile, $ca-url, $ca-identity, $crl) {
+  expr jcs:output("Request " _ $ca-profile _ " CA...");
+  var $filename = "/var/tmp/" _ $ca-profile _ ".pem";
+
+  var $del_ca = <clear-pki-ca-certificate> {
+    <ca-profile> $ca-profile;
+  }
+
+  var $res = jcs:invoke($del_ca);
+
+  var $drpc = <load-configuration> {
+    <configuration> {
+      <security> {
+        <pki> {
+          <ca-profile delete="delete"> {
+            <name> $ca-profile;
+          } 
+        }
+      }
+    }
+  }
+  expr jcs:execute($connection, $drpc);
+  call commit-config(){
+    with $message = "CA profile " _ $ca-profile _ " is deleted.";
+  }
+
+  var $rpc = <load-configuration> {
+    <configuration> {
+      <security> {
+        <pki> {
+          <ca-profile> {
+            <name> $ca-profile;
+            <ca-identity> $ca-identity;
+            <revocation-check> {
+              <crl> {
+                <url> $crl;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  expr jcs:execute($connection, $rpc);
+  call commit-config(){
+    with $message = "CA profile " _ $ca-profile _ " is added.";
+  }
+
+  var $rpc1 = <file-copy> {
+    <source> $ca-url;
+    <destination> $filename;
+  }
+  expr jcs:execute($connection, $rpc1);
+
+  mvar $done = false();
+  mvar $count = 0;
+  mvar $wait_time = 3; /* Wait 30s for CA download */
+
+  while (not($done)) {
+    set $count = $count + 1;
+
+    expr jcs:sleep(10);
+    var $rpc2 = <file-show> {
+      <filename> $filename;
+    }
+
+    var $rpc2result = normalize-space(jcs:execute($connection, $rpc2));
+    var $err = starts-with($rpc2result, 'could not');
+
+    if ($err == "true") {
+      expr jcs:output("Wait " _ $ca-profile _ " CA download, status #" _ $count _ "...");
+    } else {
+      set $done = true();
+    }
+
+    if ($count >= $wait_time) {
+      set $done = true();
+    }
+  }
+
+  expr jcs:output("Load " _ $ca-profile _ " CA...");
+  var $rpc3 = <load-pki-ca-certificate> {
+    <ca-profile> $ca-profile;
+    <filename> $filename;
+  }
+
+  expr jcs:execute($connection, $rpc3);
+  expr jcs:sleep(10);
+
+  var $rpc4 = <file-delete> {
+    <path> $filename;
+  }
+
+  var $delete = jcs:execute($connection, $rpc4);
+}
+
+template download-and-install-crl($ca-profile, $crl) {
+  var $filename = $ca-profile _ ".crl";
+  var $rpc1 = <file-copy> {
+    <source> $crl;
+    <destination> $filename;
+  }
+  expr jcs:execute($connection, $rpc1);
+  expr jcs:sleep(15);
+
+  var $rpc2 = <load-pki-crl> {
+    <ca-profile> $ca-profile;
+    <filename> $filename;
+  }
+
+  expr jcs:execute($connection, $rpc2);
+  expr jcs:sleep(10);
+
+  var $rpc3 = <file-delete> {
+    <path> $filename;
+  }
+
+  var $delete = jcs:execute($connection, $rpc3);
+}
+
+template get-ca-certificate($ca-profile) {
+  /* get the CA server's certificate based on profile. No xml rpc so need to run raw command */
+  expr jcs:output("Retrieve CA profile " _ $ca-profile _ "...");
+  call execute-request-command() {
+    with $cmd = "request security pki ca-certificate enroll ca-profile " _ $ca-profile;
+  }
+}
+
+template get-ca-status() {
+  var $rpc = <get-pki-ca-certificate>;
+  var $out = count(jcs:execute($connection, $rpc)//identifier[starts-with(., 'aamw-')]);
+
+  if ($out != 3) {
+    terminate "Get ca certificates failed. At least one ca certificate is unavailable.";
+  }
+}
+
+template check-version($version) {
+  /* we might later check the software of srx */
+  expr jcs:output("Version " _ $version _ " is valid for bootstrapping.");
+}
+
+template generate-local-keypair($local-id) {
+  /* generate local key pair */
+  expr jcs:output("Generate key pair: " _ $local-id _ "...");
+
+  var $del_lc = <clear-pki-local-certificate> {
+    <certificate-id> $local-id;  
+  }
+
+  expr jcs:execute($connection, $del_lc);
+
+  var $del_lk = <clear-pki-key-pair> {
+    <certificate-id> $local-id;
+  }
+
+  expr jcs:execute($connection, $del_lk);
+
+  var $rpc = {
+    <rpc> {
+      <generate-pki-key-pair> {
+        <certificate-id> $local-id;
+        <size> 2048;
+      }
+    }
+  }
+  expr jcs:execute($connection, $rpc);
+}
+
+template enroll-certificate($local-id, $ca-profile, $pass, $model, $sn) {
+  var $rpc = <get-pki-local-certificate>;
+
+  mvar $done = false();
+  mvar $count = 0;
+  mvar $out;
+
+  while (not($done)) {
+    set $count = $count + 1;
+    expr jcs:output("Enroll local certificate " _ $local-id _ " with CA server #" _ $count _ "...");
+    /* send SCEP request to CA server, No xml rpc so need to run raw command */
+
+    call execute-request-command() {
+      with $cmd = "request security pki local-certificate enroll certificate-id " _ $local-id _ " ca-profile " _ $ca-profile _ " challenge-password " _ $pass _ " subject CN=6wsc06gqt3zjn45y:" _ $model _ ":" _ $sn _ " email secintel-ca@juniper.net";
+    }
+    expr jcs:sleep(30);
+    set $out = count(jcs:execute($connection, $rpc)//identifier[starts-with(., $local-id)]);
+
+    if ($out == 1) {
+      set $done = true();
+    }
+
+    if ($count == $retry-counts) {
+      set $done = true();
+    }
+  }
+
+  if ($out != 1) {
+    terminate "Get local certificate failed.";
+  }
+}
+
+template add-argon-configuration($ssl-profile, $root-ca-profile, $cloud-ca-profile, $url, $cloudfeed) {
+  /* Add ssl profile configuration */
+  expr jcs:output("Configure advanced-anti-malware services...");
+  call open-config();
+  var $rpc = {
+    <load-configuration> {
+      <configuration> {
+        <services> {
+          <ssl> {
+            <initiation> {
+              <profile> {
+                <name> $ssl-profile;
+                <trusted-ca> $root-ca-profile;
+                <trusted-ca> $cloud-ca-profile;
+                <actions> {
+                  <crl> {
+                    <disable>;
+                  }
+                }
+              }
+            }
+          }
+          <advanced-anti-malware> {
+            <connection> {
+              <url> $url;
+              <authentication> {
+                <tls-profile> $ssl-profile;
+              }
+            }
+          }
+          <security-intelligence> {
+            <url> $cloudfeed;
+            <authentication> {
+              <tls-profile> $ssl-profile;
+            }
+          }
+        }
+      }
+    }
+  }
+  expr jcs:execute($connection, $rpc);
+  call commit-config(){
+    with $message = "advanced-anti-malware configuration is added.";
+  }
+}
+
+template activate-argon-configuration($ssl-profile, $local-id) {
+  call open-config();
+  var $rpc = {
+    <load-configuration> {
+      <configuration> {
+        <services> {
+          <ssl> {
+            <initiation> {
+              <profile> {
+                <name> $ssl-profile;
+                <client-certificate> $local-id;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  expr jcs:execute($connection, $rpc);
+  call commit-config(){
+    with $message = "advanced-anti-malware configuration is activated.";
+  }
+}
+
+match / {
+  /* main entry point */
+  <op-script-results> {
+    var $ca-profile = "aamw-ca";
+    var $ca-cloud-profile = "aamw-cloud-ca";
+    var $ca-secintel-profile = "aamw-secintel-ca";
+    var $local-id = "aamw-srx-cert";
+    var $ca-secintel-url = "http://va.junipersecurity.net/ca/SecInteljunipersecuritynetCA.pem";
+    var $ca-cloud-url = "http://va.junipersecurity.net/ca/SecInteljunipersecuritynetsubCAforCloud.pem";
+    var $ssl-profile = "aamw-ssl";
+    var $url-temp = "/v1/skyatp/ui_api/bootstrap/init/eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJleHAiOjE0ODIxOTgxMzksImlkIjoiNndzYzA2Z3F0M3pqbjQ1eSJ9.g4T8BPGtXuULxa7AOGfTDcgBP3LPUW5h-mR6MHNSdoA";
+    var $values = {
+      call get-model-sn();
+    }
+
+    var $host-version = {
+      call get-hostname();
+    }
+
+    var $sn-values = ext:node-set($values);
+    var $host-version-values = ext:node-set($host-version);
+    mvar $sn = $sn-values//sn;
+    mvar $model = $sn-values//model;
+    var $host = $host-version-values//host;
+    mvar $base-url = "";
+    mvar $tenant-enroll-url = "";
+
+    if ( $model == "VSRX" ) {
+      mvar $sky-atp-sn = {
+        call get-license-sn-by-name () {
+          with $license-name = "Sky ATP";
+        }
+      }
+
+      if (jcs:empty($sky-atp-sn)) {
+        expr jcs:output("Sky ATP license not found. Use freemium license...");
+        mvar $virtual-app-sn = {
+          call get-license-sn-by-name () {
+            with $license-name = "Virtual Appliance";
+          }
+        }
+
+        if (jcs:empty($virtual-app-sn)) {
+          terminate "Enrollment aborted. Please ensure your have Virtual Appliance licensed installed in your vSRX.";
+        } else {
+          set $sky-atp-sn = $virtual-app-sn;
+        }
+      }
+
+      if ($ha) { /* to preserve the order of the request parameters */
+        set $sn = str:replace($sn, "-", concat("@", $sky-atp-sn, "-"));
+        set $sn = concat($sn, "@", $sky-atp-sn);
+        set $base-url = concat("https://amer.sky.junipersecurity.net", $url-temp, "?sn=", str:replace($sn, "@", "%40"), "&model=", $model);
+        set $tenant-enroll-url = concat($base-url, "&action=enroll" );
+      } else {
+        set $sn = concat($sn, "@", $sky-atp-sn );
+        set $base-url = concat("https://amer.sky.junipersecurity.net", $url-temp, "?sn=", str:replace($sn, "@", "%40"), "&model=", $model);
+        set $tenant-enroll-url = concat($base-url, "&action=enroll", "&host=", $host);
+      }
+    } else { /* not vSRX */
+      set $base-url = concat("https://amer.sky.junipersecurity.net", $url-temp, "?sn=", $sn, "&model=", $model);
+      set $tenant-enroll-url = concat($base-url, "&action=enroll", "&host=", $host);
+    }
+
+    call check-version() {
+      with $version = $host-version-values//version;
+    }
+
+    if ($ha) {
+      expr jcs:output("Going to enroll HA pair for " _ $model _ ": " _ $sn _ " with hostname " _ $host _ "...");
+    } else {
+      expr jcs:output("Going to enroll single device for " _ $model _ ": " _ $sn _ " with hostname " _ $host _ "...");
+    }
+
+    var $finish-url = concat($base-url, "&action=enroll-finish");
+
+    call update-jdpi() {
+      with $retry-limit = $retry-counts;
+    }
+
+    var $enroll-results = call execute_remote_api() {
+      with $url = $tenant-enroll-url;
+    }
+
+    var $code = $enroll-results;
+
+    var $error = jcs:regex("File-fetch failed", $code);
+    if ($error == "File-fetch failed") {
+      terminate "Please ensure your device is licensed in Cloud side.";
+    }
+
+    call config-argon-ca() {
+      with $ca-profile = $ca-profile;
+      with $identity = "deviceCA";
+      with $enroll-url = "http://ca.junipersecurity.net:8080/ejbca/publicweb/apply/scep/SRX/pkiclient.exe";
+      with $crl = "http://va.junipersecurity.net/ca/deviceCA.crl";
+    }
+
+    var $del_tca = <load-configuration> {
+      <configuration> {
+         <services> {         
+            <ssl> {    
+              <initiation> {
+                <profile> {
+                  <name> $ssl-profile;
+                  <trusted-ca delete="delete">;
+                }
+              }
+            }
+         }
+      }
+    }
+
+    expr jcs:execute($connection, $del_tca);
+    call commit-config(){
+      with $message = "Trust CA is del from ssl profile.";
+    }
+
+    call config-and-download-ca() {
+      with $ca-profile = $ca-secintel-profile;
+      with $ca-url = $ca-secintel-url;
+      with $ca-identity = "JUNIPER";
+      with $crl = "http://va.junipersecurity.net/ca/current.crl";
+    }
+
+    call config-and-download-ca() {
+      with $ca-profile = $ca-cloud-profile;
+      with $ca-url = $ca-cloud-url;
+      with $ca-identity = "JUNIPER_CLOUD";
+      with $crl = "http://va.junipersecurity.net/ca/cloudCA.crl";
+    }
+
+    call download-and-install-crl() {
+      with $ca-profile = $ca-cloud-profile;
+      with $crl = "http://va.junipersecurity.net/ca/cloudCA.crl";
+    }
+
+    call get-ca-certificate() {
+      with $ca-profile = $ca-profile;
+    }
+
+    call get-ca-status();
+
+    var $del_cc = <load-configuration> {
+      <configuration> {
+         <services> {
+            <ssl> {
+              <initiation> {
+                <profile> {
+                  <name> $ssl-profile;
+                  <client-certificate delete="delete">;
+                }
+              }
+            }                  
+         }          
+      }
+    }
+   
+    expr jcs:execute($connection, $del_cc);
+    call commit-config(){
+      with $message = "client cert is del from ssl profile.";
+    }
+
+    call generate-local-keypair() {
+      with $local-id = $local-id;
+    }
+
+    call enroll-certificate() {
+      with $local-id = $local-id;
+      with $ca-profile = $ca-profile;
+      with $pass = $code;
+      with $model = $model;
+      with $sn = $sn;
+    }
+
+    call add-argon-configuration() {
+      with $ssl-profile = $ssl-profile;
+      with $root-ca-profile = $ca-secintel-profile;
+      with $cloud-ca-profile = $ca-cloud-profile;
+      with $url = "https://srxapi.us-west-2.sky.junipersecurity.net";
+      with $cloudfeed = "https://cloudfeeds.sky.junipersecurity.net/api/manifest.xml";
+    }
+
+    call activate-argon-configuration() {
+      with $ssl-profile = $ssl-profile;
+      with $local-id = $local-id;
+    }
+
+    var $finish-results = call execute_remote_api() {
+      with $url = $finish-url;
+    }
+
+    expr jcs:output("SRX status changed to " _ $finish-results _ "...");
+
+    call get-argon-status() {
+      with $api_type = "enroll";
+      with $seconds = 25;
+      with $retry-limit = $retry-counts;
+    }
+  }
+}
